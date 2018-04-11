@@ -4,9 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/discordapp/lilliput"
@@ -18,31 +20,61 @@ var EncodeOptions = map[string]map[int]int{
 	".webp": map[int]int{lilliput.WebpQuality: 85},
 }
 
-func main() {
-	var inputFilename string
-	var outputWidth int
-	var outputHeight int
-	var outputFilename string
-	var stretch bool
+var inputFilename string
+var outputWidth int
+var outputHeight int
+var outputFilename string
+var stretch bool
+var runs int
+var remoteInput string
+var wg sync.WaitGroup
 
+var client = &http.Client{}
+
+func main() {
 	flag.StringVar(&inputFilename, "input", "", "name of input file to resize/transcode")
+	flag.StringVar(&remoteInput, "remoteInput", "", "URL of input file to resize/transcode")
 	flag.StringVar(&outputFilename, "output", "", "name of output file, also determines output type")
 	flag.IntVar(&outputWidth, "width", 0, "width of output file")
 	flag.IntVar(&outputHeight, "height", 0, "height of output file")
+	flag.IntVar(&runs, "runs", 1, "number of workers should be spawned for the purpose of testing")
 	flag.BoolVar(&stretch, "stretch", false, "perform stretching resize instead of cropping")
 	flag.Parse()
 
-	if inputFilename == "" {
-		fmt.Printf("No input filename provided, quitting.\n")
+	for i := 0; i < runs; i++ {
+		wg.Add(1)
+		go resize(i)
+	}
+	wg.Wait()
+}
+
+func resize(i int) {
+	var err error
+	defer wg.Done()
+	outputFilename := fmt.Sprint(i, "-", outputFilename)
+
+	if inputFilename == "" && remoteInput == "" {
+		fmt.Printf("No input filename or remote input URL provided, quitting.\n")
 		flag.Usage()
-		os.Exit(1)
+		return
 	}
 
-	// decoder wants []byte, so read the whole file into a buffer
-	inputBuf, err := ioutil.ReadFile(inputFilename)
-	if err != nil {
-		fmt.Printf("failed to read input file, %s\n", err)
-		os.Exit(1)
+	var inputBuf []byte
+	if inputFilename != "" {
+		// decoder wants []byte, so read the whole file into a buffer
+		inputBuf, err = ioutil.ReadFile(inputFilename)
+		if err != nil {
+			fmt.Printf("failed to read input file, %s\n", err)
+			return
+		}
+	} else if remoteInput != "" {
+		// Fetch remote input URL
+		// decoder wants []byte, so read the whole file into a buffer
+		inputBuf, err = readRemoteURL(remoteInput)
+		if err != nil {
+			fmt.Printf("failed to read remote input, %s\n", err)
+			return
+		}
 	}
 
 	decoder, err := lilliput.NewDecoder(inputBuf)
@@ -50,7 +82,7 @@ func main() {
 	// mostly just for the magic bytes of the file to match known image formats
 	if err != nil {
 		fmt.Printf("error decoding image, %s\n", err)
-		os.Exit(1)
+		return
 	}
 	defer decoder.Close()
 
@@ -59,7 +91,7 @@ func main() {
 	// format errors
 	if err != nil {
 		fmt.Printf("error reading image header, %s\n", err)
-		os.Exit(1)
+		return
 	}
 
 	// print some basic info about the image
@@ -111,7 +143,7 @@ func main() {
 	outputImg, err = ops.Transform(decoder, opts, outputImg)
 	if err != nil {
 		fmt.Printf("error transforming image, %s\n", err)
-		os.Exit(1)
+		return
 	}
 
 	// image has been resized, now write file out
@@ -121,14 +153,31 @@ func main() {
 
 	if _, err := os.Stat(outputFilename); !os.IsNotExist(err) {
 		fmt.Printf("output filename %s exists, quitting\n", outputFilename)
-		os.Exit(1)
+		return
 	}
 
 	err = ioutil.WriteFile(outputFilename, outputImg, 0400)
 	if err != nil {
 		fmt.Printf("error writing out resized image, %s\n", err)
-		os.Exit(1)
+		return
 	}
 
 	fmt.Printf("image written to %s\n", outputFilename)
+}
+
+func readRemoteURL(url string) ([]byte, error) {
+	resp, err := client.Get(url)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return body, nil
 }
